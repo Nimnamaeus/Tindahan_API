@@ -35,7 +35,10 @@ function getUserIdFromToken() {
     try {
         $secret_key = "your_strong_secret_key_123!@#";
         $decoded = JWT::decode($token, new Key($secret_key, 'HS256'));
-        return $decoded->user_id;
+        return [
+            'user_id' => $decoded->user_id,
+            'role' => $decoded->role
+        ];
     } catch (Exception $e) {
         throw new Exception('Token validation failed: ' . $e->getMessage());
     }
@@ -43,7 +46,11 @@ function getUserIdFromToken() {
 
 function createUserProduct($conn, $data) {
     try {
-        $user_id = getUserIdFromToken();
+        $user = getUserIdFromToken();
+        
+        if ($user['role'] !== 'Seller' && $user['role'] !== 'Admin') {
+            throw new Exception('Only sellers can create products');
+        }
         
         $stmt = $conn->prepare("INSERT INTO products (product_name, description, price, 
                                                     category_id, size, color, material, 
@@ -58,7 +65,7 @@ function createUserProduct($conn, $data) {
             $data['size'],
             $data['color'],
             $data['material'],
-            $user_id
+            $user['user_id']
         ]);
         
         return $result;
@@ -122,9 +129,17 @@ switch ($path) {
         switch ($_SERVER['REQUEST_METHOD']) {
             case 'GET':
                 try {
-                    $user_id = getUserIdFromToken();
+                    $user = getUserIdFromToken();
+                    $page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
+                    $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 10;
+                    $offset = ($page - 1) * $limit;
                     
-                    // Prepare and execute query to get user's products
+                    // Get total count
+                    $countStmt = $conn->prepare("SELECT COUNT(*) as total FROM products WHERE user_id = :user_id");
+                    $countStmt->execute([':user_id' => $user['user_id']]);
+                    $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
+                    
+                    // Get paginated results
                     $stmt = $conn->prepare("SELECT 
                         product_id,
                         product_name,
@@ -136,21 +151,41 @@ switch ($path) {
                         material,
                         date_added
                         FROM products 
-                        WHERE user_id = ?
-                        ORDER BY date_added DESC");
+                        WHERE user_id = :user_id
+                        ORDER BY date_added DESC
+                        LIMIT :limit OFFSET :offset");
                     
-                    $stmt->execute([$user_id]);
+                    // Bind parameters
+                    $stmt->bindValue(':user_id', $user['user_id'], PDO::PARAM_STR);
+                    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+                    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+                    
+                    $stmt->execute();
                     $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    
+                    $totalPages = ceil($totalCount / $limit);
                     
                     if ($products) {
                         echo json_encode([
                             'success' => true,
-                            'products' => $products
+                            'products' => $products,
+                            'pagination' => [
+                                'current_page' => $page,
+                                'total_pages' => $totalPages,
+                                'total_items' => $totalCount,
+                                'items_per_page' => $limit
+                            ]
                         ]);
                     } else {
                         echo json_encode([
                             'success' => true,
                             'products' => [],
+                            'pagination' => [
+                                'current_page' => $page,
+                                'total_pages' => 0,
+                                'total_items' => 0,
+                                'items_per_page' => $limit
+                            ],
                             'message' => 'No products found'
                         ]);
                     }
@@ -174,7 +209,13 @@ switch ($path) {
 
             case 'PUT':
                 try {
-                    $user_id = getUserIdFromToken();
+                    $user = getUserIdFromToken();
+                    if ($user['role'] !== 'Seller' && $user['role'] !== 'Admin') {
+                        http_response_code(403);
+                        echo json_encode(['error' => 'Only sellers can update products']);
+                        break;
+                    }
+                    
                     $data = json_decode(file_get_contents('php://input'), true);
                     $product_id = $_GET['id'] ?? null;
                     
@@ -189,7 +230,7 @@ switch ($path) {
                     $stmt->execute([$product_id]);
                     $product = $stmt->fetch(PDO::FETCH_ASSOC);
                     
-                    if (!$product || $product['user_id'] !== $user_id) {
+                    if (!$product || $product['user_id'] !== $user['user_id']) {
                         http_response_code(403);
                         echo json_encode(['error' => 'Unauthorized to edit this product']);
                         break;
@@ -214,7 +255,7 @@ switch ($path) {
                         $data['color'],
                         $data['material'],
                         $product_id,
-                        $user_id
+                        $user['user_id']
                     ]);
                     
                     if ($result) {
@@ -233,7 +274,13 @@ switch ($path) {
 
             case 'DELETE':
                 try {
-                    $user_id = getUserIdFromToken();
+                    $user = getUserIdFromToken();
+                    if ($user['role'] !== 'Seller' && $user['role'] !== 'Admin') {
+                        http_response_code(403);
+                        echo json_encode(['error' => 'Only sellers can delete products']);
+                        break;
+                    }
+                    
                     $product_id = $_GET['id'] ?? null;
                     
                     if (!$product_id) {
@@ -245,7 +292,7 @@ switch ($path) {
                     // Verify product belongs to user and delete it
                     $stmt = $conn->prepare("DELETE FROM products 
                                           WHERE product_id = ? AND user_id = ?");
-                    $result = $stmt->execute([$product_id, $user_id]);
+                    $result = $stmt->execute([$product_id, $user['user_id']]);
                     
                     if ($stmt->rowCount() > 0) {
                         echo json_encode([
@@ -277,6 +324,9 @@ switch ($path) {
                 try {
                     $product_id = $_GET['id'] ?? null;
                     $search = $_GET['search'] ?? null;
+                    $page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
+                    $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 10;
+                    $offset = ($page - 1) * $limit;
                     
                     if ($product_id) {
                         // Get single product
@@ -310,7 +360,23 @@ switch ($path) {
                             ]);
                         }
                     } else {
-                        // Get all products with category info
+                        $baseQuery = "FROM products p
+                                     LEFT JOIN product_category pc ON p.category_id = pc.category_id";
+                        
+                        $whereClause = "";
+                        $params = [];
+                        
+                        if ($search) {
+                            $whereClause = " WHERE p.product_name LIKE :search OR p.description LIKE :search";
+                            $params[':search'] = "%$search%";
+                        }
+                        
+                        // Get total count
+                        $countStmt = $conn->prepare("SELECT COUNT(*) as total " . $baseQuery . $whereClause);
+                        $countStmt->execute($params);
+                        $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
+                        
+                        // Get paginated results
                         $query = "SELECT 
                             p.product_id,
                             p.product_name,
@@ -322,33 +388,33 @@ switch ($path) {
                             p.color,
                             p.material,
                             p.date_added
-                        FROM products p
-                        LEFT JOIN product_category pc ON p.category_id = pc.category_id
-                        WHERE 1=1";
-                        
-                        $params = [];
-                        
-                        if (isset($_GET['category'])) {
-                            $query .= " AND p.category_id = ?";
-                            $params[] = $_GET['category'];
-                        }
-                        
-                        if ($search) {
-                            $query .= " AND (p.product_name LIKE ? OR p.description LIKE ?)";
-                            $params[] = "%$search%";
-                            $params[] = "%$search%";
-                        }
-                        
-                        $query .= " ORDER BY p.date_added DESC";
+                            " . $baseQuery . $whereClause . "
+                            ORDER BY p.date_added DESC
+                            LIMIT :limit OFFSET :offset";
                         
                         $stmt = $conn->prepare($query);
-                        $stmt->execute($params);
+                        
+                        // Bind parameters
+                        if ($search) {
+                            $stmt->bindValue(':search', "%$search%", PDO::PARAM_STR);
+                        }
+                        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+                        $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+                        
+                        $stmt->execute();
                         $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                        
+                        $totalPages = ceil($totalCount / $limit);
                         
                         echo json_encode([
                             'success' => true,
                             'products' => $products,
-                            'count' => count($products)
+                            'pagination' => [
+                                'current_page' => $page,
+                                'total_pages' => $totalPages,
+                                'total_items' => $totalCount,
+                                'items_per_page' => $limit
+                            ]
                         ]);
                     }
                 } catch (Exception $e) {
